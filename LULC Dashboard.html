@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LULC Dashboard — 20 Insights (No Grand Total)</title>
+
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+<style>
+  :root{--sidebar:#0b1220;--accent:#1f6feb;--bg:#f6f9fc;--muted:#94a3b8;}
+  body{margin:0;font-family:Inter,Segoe UI,Arial;background:var(--bg);display:flex;min-height:100vh}
+  .left{width:340px;background:var(--sidebar);color:#e6eef8;padding:18px;box-sizing:border-box;overflow:auto}
+  .content{flex:1;padding:16px;box-sizing:border-box;overflow:auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;}
+  .tile{background:white;border-radius:8px;padding:8px;box-shadow:0 2px 8px rgba(16,24,40,0.06);min-height:260px;display:flex;flex-direction:column}
+  h4{margin:4px 0 8px;font-size:14px}
+  select,input[type=file],button{padding:7px;border-radius:6px;border:1px solid #cbd5e1;margin-bottom:8px}
+  button{background:var(--accent);color:white;cursor:pointer}
+  .small{font-size:13px;color:#cbd5e1}
+  .subtitle{color:#475569;font-size:13px}
+</style>
+</head>
+<body>
+
+<div class="left">
+  <h2>LULC Dashboard</h2>
+  <p class="small">Upload tidy Excel/CSV with columns: <code>State, District, Year, Category, Subcategory, Area (sq.km)</code></p>
+  <input id="fileInput" type="file" multiple accept=".xlsx,.csv"/><br>
+  <select id="yearSelect"><option value="">All Years</option></select>
+  <select id="stateSelect"><option value="">All States</option></select>
+  <select id="districtSelect"><option value="">All Districts</option></select><br>
+  <button id="refreshBtn">Refresh Charts</button>
+  <button id="resetBtn">Reset</button>
+  <p id="status" class="small">No file loaded</p>
+</div>
+
+<div class="content">
+  <h2>Land Use & Land Cover Dashboard</h2>
+  <p id="subtitle" class="subtitle">Year: All • State: All • District: All</p>
+  <div id="grid" class="grid"></div>
+</div>
+
+<script>
+// === Global Variables ===
+let records = [];
+let currentFilters = {year:'',state:'',district:''};
+
+// === Chart definitions ===
+const INSIGHTS = [
+  'Total agricultural area by district',
+  'Breakdown of cropland, fallow, plantation',
+  'Top 10 cropland districts',
+  '% share of agriculture subcategories',
+  'Built-up area by district',
+  'Built-up vs other categories',
+  'Top 5 urbanized districts',
+  'Forest area by type',
+  'District-wise forest cover',
+  'Forest vs agriculture correlation',
+  'Wasteland by type',
+  'Highest wasteland share districts',
+  'Wasteland % by district',
+  'Grass/grazing area by district',
+  'Grass vs forest relation',
+  'Wetland types',
+  'Inland wetland districts',
+  'Water body area by district',
+  'Snow/Glacier distribution',
+  'Swamp/Mangrove coverage'
+];
+
+// === Create grid ===
+const grid = document.getElementById('grid');
+INSIGHTS.forEach((t,i)=>{
+  const div=document.createElement('div');
+  div.className='tile';
+  div.innerHTML=`<h4>${i+1}. ${t}</h4><div id="chart${i}" style="flex:1"></div>`;
+  grid.appendChild(div);
+});
+
+// === File Upload ===
+document.getElementById('fileInput').addEventListener('change', handleFiles);
+document.getElementById('stateSelect').addEventListener('change', updateDistricts);
+document.getElementById('yearSelect').addEventListener('change', ()=>{currentFilters.year=yearSelect.value;updateSubtitle();renderAll();});
+document.getElementById('districtSelect').addEventListener('change', ()=>{currentFilters.district=districtSelect.value;updateSubtitle();renderAll();});
+document.getElementById('refreshBtn').addEventListener('click', renderAll);
+document.getElementById('resetBtn').addEventListener('click', resetAll);
+
+function handleFiles(evt){
+  const file = evt.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = e=>{
+    const name = file.name.toLowerCase();
+    if(name.endsWith('.csv')){
+      const text = new TextDecoder('utf-8').decode(e.target.result);
+      parseCSV(text);
+    } else {
+      const wb = XLSX.read(e.target.result,{type:'array'});
+      const js = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+      records = js.map(r=>({
+        State:String(r.State||'').trim(),
+        District:String(r.District||'').trim(),
+        Year:String(r.Year||'').trim(),
+        Category:String(r.Category||'').trim(),
+        Subcategory:String(r.Subcategory||'').trim(),
+        Area:Number(r['Area (sq.km)']||0)
+      })).filter(r=>r.District);
+    }
+    finalizeLoad();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function parseCSV(text){
+  const rows=text.split(/\r?\n/).filter(r=>r.trim());
+  const headers=rows[0].split(',').map(h=>h.trim().toLowerCase());
+  records=[];
+  for(let i=1;i<rows.length;i++){
+    const cols=rows[i].split(',');
+    if(cols.length<5) continue;
+    records.push({
+      State:cols[headers.indexOf('state')]||cols[0],
+      District:cols[headers.indexOf('district')]||cols[1],
+      Year:cols[headers.indexOf('year')]||cols[2],
+      Category:cols[headers.indexOf('category')]||cols[3],
+      Subcategory:cols[headers.indexOf('subcategory')]||cols[4],
+      Area:Number(cols[headers.indexOf('area (sq.km)')]||cols[5]||0)
+    });
+  }
+}
+
+function finalizeLoad(){
+  // remove any rows that look like a Grand Total / Total row coming from Excel exports
+  sanitizeRecords();
+
+  const years=[...new Set(records.map(r=>r.Year))].filter(Boolean).sort();
+  const states=[...new Set(records.map(r=>r.State))].filter(Boolean).sort();
+  yearSelect.innerHTML='<option value="">All Years</option>'+years.map(y=>`<option>${y}</option>`).join('');
+  stateSelect.innerHTML='<option value="">All States</option>'+states.map(s=>`<option>${s}</option>`).join('');
+  updateDistricts(); // all at first
+  updateSubtitle();
+  renderAll();
+  document.getElementById('status').innerText=`Loaded ${records.length} records`;
+}
+
+// === Remove Grand Total / Total rows ===
+function sanitizeRecords(){
+  // filter out rows where any important field contains words like "total", "grand total", or just "grand"
+  const badRe = /(^|\s)(total|grand total|grand|subtotal|grandtotal)\b/i;
+  records = records.filter(r=>{
+    const combined = `${r.State} ${r.District} ${r.Category} ${r.Subcategory}`;
+    // also ignore rows where Area is not a positive number
+    if(!r.Area || r.Area<=0) return false;
+    if(badRe.test(combined)) return false;
+    return true;
+  });
+}
+
+// === Smart District Filter ===
+function updateDistricts(){
+  const st=document.getElementById('stateSelect').value;
+  currentFilters.state=st;
+  let dlist=[];
+  if(st){
+    dlist=[...new Set(records.filter(r=>r.State===st).map(r=>r.District))].sort();
+  } else {
+    dlist=[...new Set(records.map(r=>r.District))].sort();
+  }
+  districtSelect.innerHTML='<option value="">All Districts</option>'+dlist.map(d=>`<option>${d}</option>`).join('');
+  currentFilters.district=''; 
+  updateSubtitle();
+  renderAll();
+}
+
+// === Render Charts ===
+function filtered(){
+  return records.filter(r=>
+    (!currentFilters.year||r.Year===currentFilters.year)&&
+    (!currentFilters.state||r.State===currentFilters.state)&&
+    (!currentFilters.district||r.District===currentFilters.district)
+  );
+}
+
+function renderAll(){
+  const data=filtered();
+  if(!data.length)return;
+  updateSubtitle();
+  drawBar(0,data.filter(r=>/agric/i.test(r.Category)),'District');
+  drawBar(1,data.filter(r=>/agric/i.test(r.Category)),'Subcategory');
+  drawBar(2,data.filter(r=>/crop/i.test(r.Subcategory)),'District',10);
+  drawPie(3,data.filter(r=>/agric/i.test(r.Category)),'Subcategory');
+  drawBar(4,data.filter(r=>/built/i.test(r.Category)),'District');
+  drawPie(5,data,'Category');
+  drawBar(6,data.filter(r=>/built/i.test(r.Category)),'District',5);
+  drawBar(7,data.filter(r=>/forest/i.test(r.Category)),'Subcategory');
+  drawBar(8,data.filter(r=>/forest/i.test(r.Category)),'District');
+  drawScatter(9,data.filter(r=>/forest|agric/i.test(r.Category)));
+  drawBar(10,data.filter(r=>/waste|barren/i.test(r.Category)),'Subcategory');
+  drawBar(11,data.filter(r=>/waste|barren/i.test(r.Category)),'District');
+  drawBar(12,data.filter(r=>/waste|barren/i.test(r.Category)),'District');
+  drawBar(13,data.filter(r=>/grass|graz/i.test(r.Category)),'District');
+  drawScatter(14,data.filter(r=>/grass|forest/i.test(r.Category)));
+  drawBar(15,data.filter(r=>/wetland|water|river|canal/i.test(r.Category)),'Subcategory');
+  drawBar(16,data.filter(r=>/inland|river|canal/i.test(r.Subcategory)),'District');
+  drawBar(17,data.filter(r=>/water|lake|river|tank/i.test(r.Category)),'District');
+  drawBar(18,data.filter(r=>/snow|glacier/i.test(r.Category)),'District');
+  drawBar(19,data.filter(r=>/swamp|mangrove/i.test(r.Category)),'Subcategory');
+}
+
+// === Chart Helpers ===
+function groupSum(list,key){
+  const map={};
+  list.forEach(r=>{const k=r[key]||'Unknown';map[k]=(map[k]||0)+r.Area;});
+  return Object.entries(map).sort((a,b)=>b[1]-a[1]);
+}
+function drawBar(i,list,key,limit=20){
+  const data=groupSum(list,key).slice(0,limit);
+  Plotly.newPlot(`chart${i}`,[{x:data.map(d=>d[0]),y:data.map(d=>d[1]),type:'bar'}],{margin:{t:20}});
+}
+function drawPie(i,list,key){
+  const data=groupSum(list,key);
+  Plotly.newPlot(`chart${i}`,[{labels:data.map(d=>d[0]),values:data.map(d=>d[1]),type:'pie'}],{margin:{t:20}});
+}
+function drawScatter(i,list){
+  const ag=list.filter(r=>/agric/i.test(r.Category));
+  const fr=list.filter(r=>/forest/i.test(r.Category));
+  const agmap={},frmap={};
+  ag.forEach(r=>agmap[r.District]=(agmap[r.District]||0)+r.Area);
+  fr.forEach(r=>frmap[r.District]=(frmap[r.District]||0)+r.Area);
+  const districts=[...new Set([...Object.keys(agmap),...Object.keys(frmap)])];
+  const x=districts.map(d=>agmap[d]||0), y=districts.map(d=>frmap[d]||0);
+  Plotly.newPlot(`chart${i}`,[{x,y,mode:'markers',text:districts,type:'scatter'}],{margin:{t:20},xaxis:{title:'Agriculture'},yaxis:{title:'Forest'}});
+}
+
+// === Utils ===
+function updateSubtitle(){
+  document.getElementById('subtitle').innerText=
+  `Year: ${currentFilters.year||'All'} • State: ${currentFilters.state||'All'} • District: ${currentFilters.district||'All'}`;
+}
+function resetAll(){
+  records=[];document.getElementById('fileInput').value='';
+  yearSelect.innerHTML='<option value="">All Years</option>';
+  stateSelect.innerHTML='<option value="">All States</option>';
+  districtSelect.innerHTML='<option value="">All Districts</option>';
+  grid.querySelectorAll('div[id^="chart"]').forEach(el=>el.innerHTML='');
+  updateSubtitle();document.getElementById('status').innerText='Reset done';
+}
+</script>
+</body>
+</html>
